@@ -16,6 +16,35 @@
 
 package com.biasedbit.efflux.session;
 
+import java.net.SocketAddress;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+
+import org.jboss.netty.bootstrap.ConnectionlessBootstrap;
+import org.jboss.netty.channel.ChannelPipeline;
+import org.jboss.netty.channel.ChannelPipelineFactory;
+import org.jboss.netty.channel.Channels;
+import org.jboss.netty.channel.FixedReceiveBufferSizePredictorFactory;
+import org.jboss.netty.channel.socket.DatagramChannel;
+import org.jboss.netty.channel.socket.DatagramChannelFactory;
+import org.jboss.netty.channel.socket.nio.NioDatagramChannelFactory;
+import org.jboss.netty.channel.socket.oio.OioDatagramChannelFactory;
+import org.jboss.netty.handler.execution.ExecutionHandler;
+import org.jboss.netty.handler.execution.OrderedMemoryAwareThreadPoolExecutor;
+import org.jboss.netty.util.HashedWheelTimer;
+import org.jboss.netty.util.Timeout;
+import org.jboss.netty.util.TimerTask;
+
 import com.biasedbit.efflux.logging.Logger;
 import com.biasedbit.efflux.network.ControlHandler;
 import com.biasedbit.efflux.network.ControlPacketDecoder;
@@ -39,34 +68,6 @@ import com.biasedbit.efflux.participant.ParticipantDatabase;
 import com.biasedbit.efflux.participant.ParticipantOperation;
 import com.biasedbit.efflux.participant.RtpParticipant;
 import com.biasedbit.efflux.participant.RtpParticipantInfo;
-import org.jboss.netty.bootstrap.ConnectionlessBootstrap;
-import org.jboss.netty.channel.ChannelPipeline;
-import org.jboss.netty.channel.ChannelPipelineFactory;
-import org.jboss.netty.channel.Channels;
-import org.jboss.netty.channel.FixedReceiveBufferSizePredictorFactory;
-import org.jboss.netty.channel.socket.DatagramChannel;
-import org.jboss.netty.channel.socket.DatagramChannelFactory;
-import org.jboss.netty.channel.socket.nio.NioDatagramChannelFactory;
-import org.jboss.netty.channel.socket.oio.OioDatagramChannelFactory;
-import org.jboss.netty.handler.execution.ExecutionHandler;
-import org.jboss.netty.handler.execution.OrderedMemoryAwareThreadPoolExecutor;
-import org.jboss.netty.util.HashedWheelTimer;
-import org.jboss.netty.util.Timeout;
-import org.jboss.netty.util.TimerTask;
-
-import java.net.SocketAddress;
-import java.util.List;
-import java.util.Map;
-import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLong;
-import java.util.Collections;
-import java.util.Set;
-import java.util.HashSet;
-import java.util.Collection;
 /**
  * @author <a:mailto="bruno.carvalho@wit-software.com" />Bruno de Carvalho</a>
  */
@@ -276,6 +277,10 @@ public abstract class AbstractRtpSession implements RtpSession, TimerTask {
         }
 
         LOG.debug("Data & Control channels bound for RtpSession with id {}.", this.id);
+
+        // open UDP line for NAT
+        this.pinchUdpHoleForNAT(this.localParticipant.getSsrc());
+        
         // Send first RTCP packet.
         this.joinSession(this.localParticipant.getSsrc());
         this.running.set(true);
@@ -638,6 +643,7 @@ public abstract class AbstractRtpSession implements RtpSession, TimerTask {
             }
         });
     }
+    
 
     protected void internalSendControl(ControlPacket packet, RtpParticipant participant) {
         if (!participant.isReceiver() || participant.receivedBye()) {
@@ -717,10 +723,29 @@ public abstract class AbstractRtpSession implements RtpSession, TimerTask {
         this.controlChannel.write(packet, destination);
     }
 
+    protected void pinchUdpHoleForNAT(long currentSsrc) {
+    	for (int i = 0; i < 2; i++) {
+            DataPacket packet = new DataPacket();
+            // Other fields will be set by sendDataPacket()
+            packet.setTimestamp(0);
+            packet.setData("abc".getBytes());
+            packet.setMarker(true);
+
+            if (!this.payloadTypes.contains(packet.getPayloadType()) && this.payloadTypes.size() == 1) {
+            	packet.setPayloadType(this.payloadTypes.iterator().next());
+            }
+            		
+            packet.setSsrc(currentSsrc);
+            packet.setSequenceNumber(this.sequence.incrementAndGet());
+            this.internalSendData(packet);
+		}
+    }
+    
     protected void joinSession(long currentSsrc) {
         if (!this.automatedRtcpHandling) {
             return;
         }
+        
         // Joining a session, so send an empty receiver report.
         ReceiverReportPacket emptyReceiverReport = new ReceiverReportPacket();
         emptyReceiverReport.setSenderSsrc(currentSsrc);
